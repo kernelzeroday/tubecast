@@ -124,6 +124,13 @@ enum Command {
         #[command(flatten)]
         dev: DeviceArg,
     },
+    /// Play a video immediately, pushing everything else back in the queue
+    PushTop {
+        /// YouTube URL or video id
+        target: String,
+        #[command(flatten)]
+        dev: DeviceArg,
+    },
     /// Fetch and print the transcript for a video (requires yt-dlp)
     Transcript {
         /// YouTube URL or video id
@@ -176,6 +183,7 @@ async fn run() -> Result<()> {
         Command::Devices => devices(),
         Command::LinkWeb { url, dev } => link_web(&url, dev.device.as_deref()),
         Command::Shuffle { dev } => shuffle(dev.device.as_deref()).await,
+        Command::PushTop { target, dev } => push_top(&target, dev.device.as_deref()).await,
         Command::Transcript { target, lang } => transcript(&target, &lang),
     }
 }
@@ -619,6 +627,44 @@ async fn shuffle(device: Option<&str>) -> Result<()> {
 
     q.save()?;
     println!("shuffled {} upcoming videos", upcoming.len());
+    Ok(())
+}
+
+async fn push_top(target: &str, device: Option<&str>) -> Result<()> {
+    let video_id = match parse_target(target)? {
+        Target::Video(id) => id,
+        Target::Playlist(_) => bail!("`push-top` takes a single video, not a playlist"),
+    };
+
+    let mut q = LocalQueue::load()?;
+
+    // Remove the target from wherever it sits (it may not be tracked yet).
+    q.video_ids.retain(|id| id != &video_id);
+
+    // Build the tail: everything that was in the queue, in order.
+    // Index 0 was the playing video; it goes back to position 1 so it
+    // resumes after the promoted video finishes.
+    let tail = q.video_ids.clone();
+
+    let cfg = Config::load()?;
+    let client = build_client(&cfg, device)?;
+    connect_ready(&client).await?;
+    client.play_video(video_id.clone()).await.context("send play")?;
+    finish(&client).await;
+
+    let client = build_client(&cfg, device)?;
+    connect_ready(&client).await?;
+    for id in &tail {
+        client.add_video_to_queue(id.clone()).await.context("send add")?;
+    }
+    finish(&client).await;
+
+    // Persist: promoted video is now index 0, old queue follows.
+    let mut new_ids = vec![video_id.clone()];
+    new_ids.extend(tail);
+    LocalQueue { video_ids: new_ids }.save()?;
+
+    println!("playing https://youtu.be/{video_id}");
     Ok(())
 }
 
