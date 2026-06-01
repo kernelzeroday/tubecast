@@ -119,6 +119,26 @@ enum Command {
         #[command(flatten)]
         dev: DeviceArg,
     },
+    /// Show the locally-tracked queue and what the TV is actually playing
+    Queue {
+        #[command(flatten)]
+        dev: DeviceArg,
+        /// Seconds to wait for a status update from the TV
+        #[arg(long, default_value_t = 8)]
+        timeout: u64,
+    },
+    /// Remove a video from the queue by index and resync the TV
+    QueueRemove {
+        /// Index to remove (use `queue` to see indices)
+        index: usize,
+        #[command(flatten)]
+        dev: DeviceArg,
+    },
+    /// Clear all upcoming videos from the queue (keeps current video playing)
+    QueueClear {
+        #[command(flatten)]
+        dev: DeviceArg,
+    },
     /// Shuffle the upcoming queue (reorders locally-tracked videos)
     Shuffle {
         #[command(flatten)]
@@ -182,6 +202,9 @@ async fn run() -> Result<()> {
         Command::Status { dev, timeout } => status(dev.device.as_deref(), timeout).await,
         Command::Devices => devices(),
         Command::LinkWeb { url, dev } => link_web(&url, dev.device.as_deref()),
+        Command::Queue { dev, timeout } => queue(dev.device.as_deref(), timeout).await,
+        Command::QueueRemove { index, dev } => queue_remove(index, dev.device.as_deref()).await,
+        Command::QueueClear { dev } => queue_clear(dev.device.as_deref()).await,
         Command::Shuffle { dev } => shuffle(dev.device.as_deref()).await,
         Command::PushTop { target, dev } => push_top(&target, dev.device.as_deref()).await,
         Command::Transcript { target, lang } => transcript(&target, &lang),
@@ -585,6 +608,126 @@ async fn connect_ready(client: &LoungeClient) -> Result<()> {
 async fn finish(client: &LoungeClient) {
     sleep(Duration::from_millis(300)).await;
     let _ = client.disconnect().await;
+}
+
+async fn queue(device: Option<&str>, timeout: u64) -> Result<()> {
+    let q = LocalQueue::load()?;
+
+    // Get currently playing from TV
+    let cfg = Config::load()?;
+    let client = build_client(&cfg, device)?;
+    let mut rx = client.event_receiver();
+    connect_ready(&client).await?;
+
+    let remote_id = {
+        let deadline = Instant::now() + Duration::from_secs(timeout);
+        let mut found = None;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(LoungeEvent::NowPlaying(np))) if !np.video_id.is_empty() => {
+                    found = Some(np.video_id);
+                    break;
+                }
+                Ok(Ok(LoungeEvent::PlaybackSession(s))) if !s.video_id.is_empty() => {
+                    found = Some(s.video_id);
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+        found
+    };
+    finish(&client).await;
+
+    // Print remote status
+    match &remote_id {
+        Some(id) => println!("remote: https://youtu.be/{id}"),
+        None => println!("remote: unknown (TV not responding)"),
+    }
+
+    if q.video_ids.is_empty() {
+        println!("local:  (empty)");
+        return Ok(());
+    }
+
+    println!("local:");
+    let local_current = q.video_ids.first().map(String::as_str);
+    for (i, id) in q.video_ids.iter().enumerate() {
+        let marker = if i == 0 { " (playing)" } else { "" };
+        println!("  {i}  https://youtu.be/{id}{marker}");
+    }
+
+    // Drift check
+    if let (Some(rid), Some(lid)) = (&remote_id, local_current) {
+        if rid != lid {
+            println!("\nwarning: remote is playing {rid} but local thinks {lid} — run `push-top` or `play` to resync");
+        }
+    }
+    Ok(())
+}
+
+async fn queue_remove(index: usize, device: Option<&str>) -> Result<()> {
+    let mut q = LocalQueue::load()?;
+    if q.video_ids.is_empty() {
+        bail!("local queue is empty");
+    }
+    if index == 0 {
+        bail!("index 0 is the currently playing video; use `play` to change it");
+    }
+    if index >= q.video_ids.len() {
+        bail!("index {index} out of range (queue has {} entries)", q.video_ids.len());
+    }
+
+    let removed = q.video_ids.remove(index);
+
+    // Resync: play current (index 0) and re-add the remaining tail
+    let current = q.video_ids[0].clone();
+    let tail = q.video_ids[1..].to_vec();
+
+    let cfg = Config::load()?;
+    let client = build_client(&cfg, device)?;
+    connect_ready(&client).await?;
+    client.play_video(current.clone()).await.context("send play")?;
+    finish(&client).await;
+
+    let client = build_client(&cfg, device)?;
+    connect_ready(&client).await?;
+    for id in &tail {
+        client.add_video_to_queue(id.clone()).await.context("send add")?;
+    }
+    finish(&client).await;
+
+    q.save()?;
+    println!("removed [{index}] https://youtu.be/{removed}");
+    Ok(())
+}
+
+async fn queue_clear(device: Option<&str>) -> Result<()> {
+    let mut q = LocalQueue::load()?;
+    if q.video_ids.len() <= 1 {
+        println!("queue is already empty");
+        return Ok(());
+    }
+
+    let current = q.video_ids[0].clone();
+    let removed = q.video_ids.len() - 1;
+
+    // Resync: play current only, no adds
+    let cfg = Config::load()?;
+    let client = build_client(&cfg, device)?;
+    connect_ready(&client).await?;
+    client.play_video(current.clone()).await.context("send play")?;
+    finish(&client).await;
+
+    q.video_ids.truncate(1);
+    q.save()?;
+    println!("cleared {removed} upcoming videos (still playing https://youtu.be/{current})");
+    Ok(())
 }
 
 async fn shuffle(device: Option<&str>) -> Result<()> {
