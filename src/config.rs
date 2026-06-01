@@ -90,6 +90,12 @@ impl LocalQueue {
         q.video_ids.push(video_id.to_string());
         q.save()
     }
+
+    /// Wipe the local queue (called when playing a playlist, since we can't
+    /// track playlist contents).
+    pub fn clear() -> Result<()> {
+        Self::default().save()
+    }
 }
 
 impl Config {

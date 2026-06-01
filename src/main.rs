@@ -1,18 +1,23 @@
 mod config;
 mod parse;
+mod queue;
 mod search;
+mod transcript;
+mod transport;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use config::{Config, Device, LocalQueue};
-use dialoguer::{theme::ColorfulTheme, FuzzySelect};
+use dialoguer::{theme::ColorfulTheme, FuzzySelect, Input};
 use parse::{parse_target, Target};
 use std::io::IsTerminal;
 use std::time::Duration;
-use tokio::time::{sleep, Instant};
+use tokio::time::Instant;
+use transport::{
+    build_client, connect_ready, drain_events, finish, play_video_confirmed, probe_screen,
+    wait_confirm, wait_queued, Action, CastResult, Reachability,
+};
 use youtube_lounge_rs::{LoungeClient, LoungeEvent, PlaybackStatus};
-
-const DEVICE_NAME: &str = "tubecast";
 
 #[derive(Parser)]
 #[command(
@@ -151,29 +156,6 @@ enum Command {
         #[command(flatten)]
         dev: DeviceArg,
     },
-    /// Show metadata for a video: title, channel, views, description (requires yt-dlp)
-    Info {
-        /// YouTube URL or video id (defaults to currently playing)
-        target: Option<String>,
-        #[command(flatten)]
-        dev: DeviceArg,
-        /// Seconds to wait for TV status when no target is given
-        #[arg(long, default_value_t = 8)]
-        timeout: u64,
-    },
-    /// Show top comments for a video (requires yt-dlp)
-    Comments {
-        /// YouTube URL or video id (defaults to currently playing)
-        target: Option<String>,
-        #[command(flatten)]
-        dev: DeviceArg,
-        /// Number of comments to show
-        #[arg(short, long, default_value_t = 5)]
-        limit: usize,
-        /// Seconds to wait for TV status when no target is given
-        #[arg(long, default_value_t = 8)]
-        timeout: u64,
-    },
     /// Fetch and print the transcript for a video (requires yt-dlp)
     Transcript {
         /// YouTube URL or video id
@@ -225,22 +207,22 @@ async fn run() -> Result<()> {
         Command::Status { dev, timeout } => status(dev.device.as_deref(), timeout).await,
         Command::Devices => devices(),
         Command::LinkWeb { url, dev } => link_web(&url, dev.device.as_deref()),
-        Command::Queue { dev, timeout } => queue(dev.device.as_deref(), timeout).await,
-        Command::QueueRemove { index, dev } => queue_remove(index, dev.device.as_deref()).await,
-        Command::QueueClear { dev } => queue_clear(dev.device.as_deref()).await,
-        Command::Shuffle { dev } => shuffle(dev.device.as_deref()).await,
-        Command::PushTop { target, dev } => push_top(&target, dev.device.as_deref()).await,
-        Command::Info { target, dev, timeout } => {
-            info_cmd(target.as_deref(), dev.device.as_deref(), timeout).await
+        Command::Queue { dev, timeout } => queue::queue(dev.device.as_deref(), timeout).await,
+        Command::QueueRemove { index, dev } => {
+            queue::queue_remove(index, dev.device.as_deref()).await
         }
-        Command::Comments { target, dev, limit, timeout } => {
-            comments_cmd(target.as_deref(), dev.device.as_deref(), limit, timeout).await
+        Command::QueueClear { dev } => queue::queue_clear(dev.device.as_deref()).await,
+        Command::Shuffle { dev } => queue::shuffle(dev.device.as_deref()).await,
+        Command::PushTop { target, dev } => {
+            queue::push_top(&target, dev.device.as_deref()).await
         }
-        Command::Transcript { target, lang } => transcript(&target, &lang),
+        Command::Transcript { target, lang } => transcript::transcript(&target, &lang),
     }
 }
 
-async fn pair(code: &str, alias: Option<String>, default: bool) -> Result<()> {
+/// Pair (or re-pair) a device from a TV code, upserting it into the config.
+/// Returns the device's friendly name, alias, and whether it became default.
+async fn do_pair(code: &str, alias: Option<String>, default: bool) -> Result<(String, String, bool)> {
     let cleaned: String = code.chars().filter(|c| !c.is_whitespace()).collect();
     let screen = LoungeClient::pair_with_screen(&cleaned)
         .await
@@ -262,7 +244,11 @@ async fn pair(code: &str, alias: Option<String>, default: bool) -> Result<()> {
         cfg.default_device = Some(alias.clone());
     }
     cfg.save()?;
+    Ok((name, alias, make_default))
+}
 
+async fn pair(code: &str, alias: Option<String>, default: bool) -> Result<()> {
+    let (name, alias, make_default) = do_pair(code, alias, default).await?;
     println!(
         "paired '{name}' as '{alias}'{}",
         if make_default { " (default)" } else { "" }
@@ -272,17 +258,11 @@ async fn pair(code: &str, alias: Option<String>, default: bool) -> Result<()> {
 
 async fn play(target: &str, device: Option<&str>) -> Result<()> {
     let cfg = Config::load()?;
-    let client = build_client(&cfg, device)?;
-    connect_ready(&client).await?;
     match parse_target(target)? {
-        Target::Video(id) => {
-            client.play_video(id.clone()).await.context("send play")?;
-            if let Err(e) = LocalQueue::reset(&id) {
-                eprintln!("warning: could not update local queue: {e}");
-            }
-            println!("playing https://youtu.be/{id}");
-        }
+        Target::Video(id) => cast(&cfg, device, &id, false, "").await,
         Target::Playlist(list) => {
+            let client = build_client(&cfg, device)?;
+            connect_ready(&client).await?;
             client
                 .play_playlist(list.clone())
                 .await
@@ -291,95 +271,133 @@ async fn play(target: &str, device: Option<&str>) -> Result<()> {
                 eprintln!("warning: could not clear local queue: {e}");
             }
             println!("playing playlist {list}");
+            finish(&client).await;
+            Ok(())
         }
     }
-    finish(&client).await;
-    Ok(())
 }
 
 async fn add(target: &str, device: Option<&str>) -> Result<()> {
     let cfg = Config::load()?;
-    let client = build_client(&cfg, device)?;
-    connect_ready(&client).await?;
     match parse_target(target)? {
-        Target::Video(id) => {
-            client
-                .add_video_to_queue(id.clone())
-                .await
-                .context("send add")?;
-            if let Err(e) = LocalQueue::push(&id) {
-                eprintln!("warning: could not update local queue: {e}");
-            }
-            println!("queued https://youtu.be/{id}");
-        }
+        Target::Video(id) => cast(&cfg, device, &id, true, "").await,
         Target::Playlist(_) => bail!("`add` takes a single video; use `play` for a playlist"),
     }
-    finish(&client).await;
+}
+
+/// How long to wait for the TV to confirm a queue change before probing.
+const CONFIRM_WAIT: Duration = Duration::from_secs(6);
+
+/// Cast (play or queue) a single video and confirm it took effect. If the TV
+/// silently ignores the command — which happens once its cast session has
+/// rotated (e.g. after switching apps on the TV, which gives Playlet a new
+/// screen id and orphans the old pairing) — offer to re-pair with a fresh code
+/// and retry automatically.
+async fn cast(
+    cfg: &Config,
+    device: Option<&str>,
+    video_id: &str,
+    queue: bool,
+    suffix: &str,
+) -> Result<()> {
+    if cast_once(cfg, device, video_id, queue, suffix).await? {
+        return Ok(());
+    }
+    // The cast wasn't confirmed. A reachable-but-ignoring screen (stale session)
+    // or an unpaired one can only be fixed by a fresh pairing code; a genuinely
+    // unavailable screen just needs the TV/app brought up.
+    match probe_screen(cfg, device).await {
+        Ok(Reachability::Unavailable) => {
+            eprintln!("note: the screen isn't responding — make sure the TV is on with the YouTube/Playlet app open and in the foreground.");
+        }
+        Ok(Reachability::Available | Reachability::Unpaired) => {
+            if try_repair(cfg, device).await? {
+                let cfg = Config::load()?; // re-pairing rewrote the stored screen id
+                cast_once(&cfg, device, video_id, queue, suffix).await?;
+            }
+        }
+        Err(_) => {}
+    }
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-enum Action {
-    Resume,
-    Pause,
-    Next,
-    Prev,
-    SkipAd,
-    Mute,
-    Unmute,
-    Seek(f64),
-    Volume(i32),
+/// A single cast attempt. Returns whether the TV confirmed it.
+async fn cast_once(
+    cfg: &Config,
+    device: Option<&str>,
+    video_id: &str,
+    queue: bool,
+    suffix: &str,
+) -> Result<bool> {
+    let client = build_client(cfg, device)?;
+    let mut rx = client.event_receiver();
+    connect_ready(&client).await?;
+    drain_events(&mut rx);
+
+    let confirmed = if queue {
+        client
+            .add_video_to_queue(video_id.to_string())
+            .await
+            .context("send add")?;
+        if let Err(e) = LocalQueue::push(video_id) {
+            eprintln!("warning: could not update local queue: {e}");
+        }
+        // Not resent on failure: a missed ack would otherwise double-queue.
+        let ok = wait_queued(&mut rx, CONFIRM_WAIT).await;
+        println!(
+            "queued https://youtu.be/{video_id}{suffix}{}",
+            if ok { "" } else { " (unconfirmed)" }
+        );
+        ok
+    } else {
+        if let Err(e) = LocalQueue::reset(video_id) {
+            eprintln!("warning: could not update local queue: {e}");
+        }
+        match play_video_confirmed(&client, &mut rx, video_id).await? {
+            CastResult::Confirmed(status) => {
+                println!("playing https://youtu.be/{video_id}{suffix} [{status}]");
+                true
+            }
+            CastResult::OtherPlaying(other) => {
+                println!("playing https://youtu.be/{video_id}{suffix} (unconfirmed)");
+                eprintln!("note: the TV is still on https://youtu.be/{other} — the cast didn't take effect.");
+                false
+            }
+            CastResult::Unconfirmed => {
+                println!("playing https://youtu.be/{video_id}{suffix} (unconfirmed)");
+                false
+            }
+        }
+    };
+    finish(&client).await;
+    Ok(confirmed)
 }
 
-impl Action {
-    fn label(self) -> String {
-        match self {
-            Action::Resume => "resumed".into(),
-            Action::Pause => "paused".into(),
-            Action::Next => "next".into(),
-            Action::Prev => "previous".into(),
-            Action::SkipAd => "ad skipped".into(),
-            Action::Mute => "muted".into(),
-            Action::Unmute => "unmuted".into(),
-            Action::Seek(s) => format!("seeked to {s}s"),
-            Action::Volume(v) => format!("volume {v}"),
-        }
+/// Prompt for a fresh TV code and re-pair the device in place. Returns whether
+/// a re-pair happened, so the caller knows to retry. Non-interactive callers
+/// just get the hint, since there's no way to read a code off the TV.
+async fn try_repair(cfg: &Config, device: Option<&str>) -> Result<bool> {
+    let alias = cfg.resolve(device)?.alias.clone();
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        eprintln!("note: {}", transport::UNPAIRED_HINT);
+        return Ok(false);
     }
-
-    async fn dispatch(self, client: &LoungeClient) -> Result<()> {
-        match self {
-            Action::Resume => client.play().await?,
-            Action::Pause => client.pause().await?,
-            Action::Next => client.next().await?,
-            Action::Prev => client.previous().await?,
-            Action::SkipAd => client.skip_ad().await?,
-            Action::Mute => client.mute().await?,
-            Action::Unmute => client.unmute().await?,
-            Action::Seek(s) => client.seek_to(s).await?,
-            Action::Volume(v) => client.set_volume(v).await?,
-        }
-        Ok(())
+    eprintln!(
+        "the cast didn't take effect — the TV's cast session has changed \
+         (common after switching apps on the TV), so the old pairing is stale."
+    );
+    let code: String = Input::with_theme(&ColorfulTheme::default())
+        .with_prompt("Enter a fresh code from the TV's \"Link with TV code\" screen (blank to skip)")
+        .allow_empty(true)
+        .interact_text()?;
+    let code = code.trim();
+    if code.is_empty() {
+        eprintln!("skipped — re-pair later with `tubecast pair <CODE>`.");
+        return Ok(false);
     }
-
-    /// Does this event confirm the action took effect on the screen?
-    fn confirmed_by(self, ev: &LoungeEvent) -> bool {
-        use PlaybackStatus::{Buffering, Paused, Playing, Starting};
-        let state_is = |ev: &LoungeEvent, want: &[PlaybackStatus]| match ev {
-            LoungeEvent::StateChange(s) => want.contains(&s.status()),
-            LoungeEvent::NowPlaying(n) => want.contains(&n.status()),
-            _ => false,
-        };
-        match self {
-            Action::Resume => state_is(ev, &[Playing, Starting, Buffering]),
-            Action::Pause => state_is(ev, &[Paused]),
-            Action::Mute | Action::Unmute | Action::Volume(_) => {
-                matches!(ev, LoungeEvent::VolumeChanged(_))
-            }
-            Action::Next | Action::Prev | Action::SkipAd | Action::Seek(_) => {
-                matches!(ev, LoungeEvent::StateChange(_) | LoungeEvent::NowPlaying(_))
-            }
-        }
-    }
+    let (name, _, _) = do_pair(code, Some(alias), false).await?;
+    eprintln!("re-paired '{name}' — retrying…");
+    Ok(true)
 }
 
 async fn simple(device: Option<&str>, action: Action) -> Result<()> {
@@ -393,13 +411,8 @@ async fn simple(device: Option<&str>, action: Action) -> Result<()> {
     let mut rx = client.event_receiver();
     connect_ready(&client).await?;
 
-    // Discard events buffered during connection so stale NowPlaying/StateChange
-    // events don't falsely confirm the action before the TV sees it.
     drain_events(&mut rx);
 
-    // The bind channel can drop a freshly-sent control command before the
-    // screen acts on it, so send, wait for the screen to confirm the new
-    // state, and resend once if the first attempt goes unacknowledged.
     action.dispatch(&client).await?;
     let mut confirmed = wait_confirm(&mut rx, action, Duration::from_millis(1500)).await;
     if !confirmed {
@@ -416,39 +429,14 @@ async fn simple(device: Option<&str>, action: Action) -> Result<()> {
     Ok(())
 }
 
-fn drain_events(rx: &mut tokio::sync::broadcast::Receiver<LoungeEvent>) {
-    loop {
-        match rx.try_recv() {
-            Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
-            Err(_) => break,
-        }
-    }
-}
-
-async fn wait_confirm(
-    rx: &mut tokio::sync::broadcast::Receiver<LoungeEvent>,
-    action: Action,
-    dur: Duration,
-) -> bool {
-    let deadline = Instant::now() + dur;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return false;
-        }
-        match tokio::time::timeout(remaining, rx.recv()).await {
-            Ok(Ok(ev)) => {
-                if action.confirmed_by(&ev) {
-                    return true;
-                }
-            }
-            _ => return false,
-        }
-    }
-}
-
 async fn status(device: Option<&str>, timeout: u64) -> Result<()> {
     let cfg = Config::load()?;
+    // connect_ready succeeding already proves the pairing is live, so an empty
+    // result here means the screen is connected but idle, not unreachable.
+    let dev_label = cfg
+        .resolve(device)
+        .map(|d| d.name.clone())
+        .unwrap_or_else(|_| "the screen".to_string());
     let client = build_client(&cfg, device)?;
     let mut rx = client.event_receiver();
     connect_ready(&client).await?;
@@ -457,7 +445,7 @@ async fn status(device: Option<&str>, timeout: u64) -> Result<()> {
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            println!("no status received (nothing playing?)");
+            print_idle(&dev_label);
             break;
         }
         match tokio::time::timeout(remaining, rx.recv()).await {
@@ -484,13 +472,18 @@ async fn status(device: Option<&str>, timeout: u64) -> Result<()> {
             Ok(Ok(_)) => continue,
             Ok(Err(_)) => break,
             Err(_) => {
-                println!("no status received (nothing playing?)");
+                print_idle(&dev_label);
                 break;
             }
         }
     }
     finish(&client).await;
     Ok(())
+}
+
+fn print_idle(dev_label: &str) {
+    println!("connected to {dev_label}, but nothing is playing.");
+    println!("(if you just switched apps on the TV, playback in the old app stopped — cast again with `tubecast play <video>`)");
 }
 
 fn devices() -> Result<()> {
@@ -541,7 +534,6 @@ async fn run_search(
     let idx = if first {
         0
     } else if !interactive {
-        // Scriptable: emit "<videoId>\t<label>" and let the caller choose.
         for r in &results {
             println!("{}\t{}", r.video_id, r.label());
         }
@@ -568,31 +560,8 @@ async fn run_search(
     };
 
     let chosen = &results[idx];
-    cast_video(&cfg, device, &chosen.video_id, queue).await?;
-    println!(
-        "{} https://youtu.be/{}  ({})",
-        if queue { "queued" } else { "playing" },
-        chosen.video_id,
-        chosen.title
-    );
-    Ok(())
-}
-
-async fn cast_video(cfg: &Config, device: Option<&str>, video_id: &str, queue: bool) -> Result<()> {
-    let client = build_client(cfg, device)?;
-    connect_ready(&client).await?;
-    if queue {
-        client.add_video_to_queue(video_id.to_string()).await?;
-        if let Err(e) = LocalQueue::push(video_id) {
-            eprintln!("warning: could not update local queue: {e}");
-        }
-    } else {
-        client.play_video(video_id.to_string()).await?;
-        if let Err(e) = LocalQueue::reset(video_id) {
-            eprintln!("warning: could not update local queue: {e}");
-        }
-    }
-    finish(&client).await;
+    let suffix = format!("  ({})", chosen.title);
+    cast(&cfg, device, &chosen.video_id, queue, &suffix).await?;
     Ok(())
 }
 
@@ -609,524 +578,6 @@ fn link_web(url: &str, device: Option<&str>) -> Result<()> {
     cfg.save()?;
     println!("linked '{alias}' -> {trimmed} (search enabled)");
     Ok(())
-}
-
-fn build_client(cfg: &Config, device: Option<&str>) -> Result<LoungeClient> {
-    let dev = cfg.resolve(device)?;
-    let client = LoungeClient::new(&dev.screen_id, &dev.lounge_token, DEVICE_NAME, None, None);
-    Ok(client)
-}
-
-/// connect_with_refresh returns before the background manager flips the state
-/// to Connected; send_command errors until then, so wait for readiness.
-async fn connect_ready(client: &LoungeClient) -> Result<()> {
-    client
-        .set_token_refresh_callback(Config::update_token)
-        .await;
-    client
-        .connect_with_refresh()
-        .await
-        .context("connecting to screen (is the TV on with Playlet/YouTube open?)")?;
-
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let state = format!("{:?}", client.current_state());
-        if state == "Connected" {
-            return Ok(());
-        }
-        if state.starts_with("Failed") {
-            bail!("connection failed: {state}");
-        }
-        if Instant::now() > deadline {
-            bail!("timed out waiting for the screen to connect");
-        }
-        sleep(Duration::from_millis(150)).await;
-    }
-}
-
-/// Give the command a moment to flush over the bind channel, then disconnect.
-async fn finish(client: &LoungeClient) {
-    sleep(Duration::from_millis(300)).await;
-    let _ = client.disconnect().await;
-}
-
-async fn get_now_playing(cfg: &Config, device: Option<&str>, timeout: u64) -> Option<String> {
-    let client = build_client(cfg, device).ok()?;
-    let mut rx = client.event_receiver();
-    connect_ready(&client).await.ok()?;
-    let deadline = Instant::now() + Duration::from_secs(timeout);
-    let found = loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break None;
-        }
-        match tokio::time::timeout(remaining, rx.recv()).await {
-            Ok(Ok(LoungeEvent::NowPlaying(np))) if !np.video_id.is_empty() => {
-                break Some(np.video_id);
-            }
-            Ok(Ok(LoungeEvent::PlaybackSession(s))) if !s.video_id.is_empty() => {
-                break Some(s.video_id);
-            }
-            Ok(Ok(_)) => continue,
-            _ => break None,
-        }
-    };
-    finish(&client).await;
-    found
-}
-
-async fn replay_queue(
-    cfg: &Config,
-    device: Option<&str>,
-    current: &str,
-    tail: &[String],
-) -> Result<()> {
-    let client = build_client(cfg, device)?;
-    connect_ready(&client).await?;
-    client
-        .play_video(current.to_string())
-        .await
-        .context("send play")?;
-    finish(&client).await;
-
-    if !tail.is_empty() {
-        let client = build_client(cfg, device)?;
-        connect_ready(&client).await?;
-        for id in tail {
-            client
-                .add_video_to_queue(id.clone())
-                .await
-                .context("send add")?;
-        }
-        finish(&client).await;
-    }
-    Ok(())
-}
-
-fn check_drift(q: &LocalQueue, remote_id: &Option<String>) -> Result<()> {
-    if let Some(rid) = remote_id {
-        if let Some(lid) = q.video_ids.first() {
-            if rid != lid {
-                bail!(
-                    "local queue is out of sync: TV is playing {rid} but local \
-                     tracks {lid}. Run `tubecast play` or `tubecast push-top` to resync, \
-                     or `tubecast queue` to inspect."
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn queue(device: Option<&str>, timeout: u64) -> Result<()> {
-    let q = LocalQueue::load()?;
-    let cfg = Config::load()?;
-    let remote_id = get_now_playing(&cfg, device, timeout).await;
-
-    match &remote_id {
-        Some(id) => println!("remote: https://youtu.be/{id}"),
-        None => println!("remote: unknown (TV not responding)"),
-    }
-
-    if q.video_ids.is_empty() {
-        println!("local:  (empty)");
-        return Ok(());
-    }
-
-    println!("local:");
-    let local_current = q.video_ids.first().map(String::as_str);
-    for (i, id) in q.video_ids.iter().enumerate() {
-        let marker = if i == 0 { " (playing)" } else { "" };
-        println!("  {i}  https://youtu.be/{id}{marker}");
-    }
-
-    // Drift check
-    if let (Some(rid), Some(lid)) = (&remote_id, local_current) {
-        if rid != lid {
-            println!("\nwarning: remote is playing {rid} but local thinks {lid} — run `push-top` or `play` to resync");
-        }
-    }
-    Ok(())
-}
-
-async fn queue_remove(index: usize, device: Option<&str>) -> Result<()> {
-    let mut q = LocalQueue::load()?;
-    if q.video_ids.is_empty() {
-        bail!("local queue is empty");
-    }
-    if index == 0 {
-        bail!("index 0 is the currently playing video; use `play` to change it");
-    }
-    if index >= q.video_ids.len() {
-        bail!("index {index} out of range (queue has {} entries)", q.video_ids.len());
-    }
-
-    let cfg = Config::load()?;
-    let remote_id = get_now_playing(&cfg, device, 5).await;
-    check_drift(&q, &remote_id)?;
-
-    let removed = q.video_ids.remove(index);
-    let current = q.video_ids[0].clone();
-    let tail = q.video_ids[1..].to_vec();
-
-    replay_queue(&cfg, device, &current, &tail).await?;
-    q.save()?;
-    println!("removed [{index}] https://youtu.be/{removed}");
-    Ok(())
-}
-
-async fn queue_clear(device: Option<&str>) -> Result<()> {
-    let mut q = LocalQueue::load()?;
-    if q.video_ids.len() <= 1 {
-        println!("queue is already empty");
-        return Ok(());
-    }
-
-    let cfg = Config::load()?;
-    let remote_id = get_now_playing(&cfg, device, 5).await;
-    check_drift(&q, &remote_id)?;
-
-    let current = q.video_ids[0].clone();
-    let removed = q.video_ids.len() - 1;
-
-    replay_queue(&cfg, device, &current, &[]).await?;
-    q.video_ids.truncate(1);
-    q.save()?;
-    println!("cleared {removed} upcoming videos (still playing https://youtu.be/{current})");
-    Ok(())
-}
-
-async fn shuffle(device: Option<&str>) -> Result<()> {
-    let mut q = LocalQueue::load()?;
-    if q.video_ids.len() < 2 {
-        bail!("nothing in the queue to shuffle");
-    }
-
-    let cfg = Config::load()?;
-    let remote_id = get_now_playing(&cfg, device, 5).await;
-    check_drift(&q, &remote_id)?;
-
-    let mut rng = Rng::new();
-    let tail = &mut q.video_ids[1..];
-    for i in (1..tail.len()).rev() {
-        let j = rng.below(i + 1);
-        tail.swap(i, j);
-    }
-
-    let current = q.video_ids[0].clone();
-    let upcoming = q.video_ids[1..].to_vec();
-
-    replay_queue(&cfg, device, &current, &upcoming).await?;
-    q.save()?;
-    println!("shuffled {} upcoming videos", upcoming.len());
-    Ok(())
-}
-
-async fn push_top(target: &str, device: Option<&str>) -> Result<()> {
-    let video_id = match parse_target(target)? {
-        Target::Video(id) => id,
-        Target::Playlist(_) => bail!("`push-top` takes a single video, not a playlist"),
-    };
-
-    let mut q = LocalQueue::load()?;
-    q.video_ids.retain(|id| id != &video_id);
-    let tail = q.video_ids.clone();
-
-    let cfg = Config::load()?;
-    replay_queue(&cfg, device, &video_id, &tail).await?;
-
-    let mut new_ids = vec![video_id.clone()];
-    new_ids.extend(tail);
-    LocalQueue { video_ids: new_ids }.save()?;
-
-    println!("playing https://youtu.be/{video_id}");
-    Ok(())
-}
-
-struct Rng(u64);
-
-impl Rng {
-    fn new() -> Self {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut h = DefaultHasher::new();
-        std::time::SystemTime::now().hash(&mut h);
-        std::thread::current().id().hash(&mut h);
-        Self(h.finish())
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    fn below(&mut self, n: usize) -> usize {
-        let n = n as u64;
-        let threshold = n.wrapping_neg() % n; // reject below this to avoid modulo bias
-        loop {
-            let r = self.next_u64();
-            if r >= threshold {
-                return (r % n) as usize;
-            }
-        }
-    }
-}
-
-/// Resolve a video ID from an explicit target, or fall back to whatever
-/// the TV is currently playing.
-async fn resolve_video_id(
-    target: Option<&str>,
-    device: Option<&str>,
-    timeout: u64,
-) -> Result<String> {
-    if let Some(t) = target {
-        return match parse_target(t)? {
-            Target::Video(id) => Ok(id),
-            Target::Playlist(_) => bail!("this command requires a single video, not a playlist"),
-        };
-    }
-    // No target — ask the TV
-    let cfg = Config::load()?;
-    let client = build_client(&cfg, device)?;
-    let mut rx = client.event_receiver();
-    connect_ready(&client).await?;
-    let deadline = Instant::now() + Duration::from_secs(timeout);
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            bail!("no status from TV (nothing playing?)");
-        }
-        match tokio::time::timeout(remaining, rx.recv()).await {
-            Ok(Ok(LoungeEvent::NowPlaying(np))) if !np.video_id.is_empty() => {
-                finish(&client).await;
-                return Ok(np.video_id);
-            }
-            Ok(Ok(LoungeEvent::PlaybackSession(s))) if !s.video_id.is_empty() => {
-                finish(&client).await;
-                return Ok(s.video_id);
-            }
-            Ok(Ok(_)) => continue,
-            _ => bail!("lost connection to TV"),
-        }
-    }
-}
-
-/// Run yt-dlp -j on a video and return parsed JSON.
-fn yt_dlp_json(video_id: &str, extra_args: &[&str]) -> Result<serde_json::Value> {
-    let url = format!("https://www.youtube.com/watch?v={video_id}");
-    let mut cmd = std::process::Command::new("yt-dlp");
-    cmd.args(["-j", "--skip-download"]);
-    cmd.args(extra_args);
-    cmd.arg(&url);
-    cmd.stderr(std::process::Stdio::null());
-    let out = cmd
-        .output()
-        .context("yt-dlp not found; install with `brew install yt-dlp`")?;
-    if !out.status.success() {
-        bail!("yt-dlp failed for {video_id}");
-    }
-    serde_json::from_slice(&out.stdout).context("parsing yt-dlp JSON output")
-}
-
-async fn info_cmd(target: Option<&str>, device: Option<&str>, timeout: u64) -> Result<()> {
-    let video_id = resolve_video_id(target, device, timeout).await?;
-    let v = yt_dlp_json(&video_id, &[])?;
-
-    let title = v["title"].as_str().unwrap_or("unknown");
-    let channel = v["uploader"].as_str().unwrap_or(v["channel"].as_str().unwrap_or("unknown"));
-    let views = v["view_count"].as_u64().map(human_views).unwrap_or_default();
-    let likes = v["like_count"].as_u64().map(human_views).unwrap_or_default();
-    let duration = v["duration"].as_f64().map(|s| fmt_duration_secs(s as u64)).unwrap_or_default();
-    let uploaded = v["upload_date"].as_str().unwrap_or("").to_string();
-    let uploaded = if uploaded.len() == 8 {
-        format!("{}-{}-{}", &uploaded[..4], &uploaded[4..6], &uploaded[6..])
-    } else {
-        uploaded
-    };
-    let desc = v["description"].as_str().unwrap_or("").trim().to_string();
-    let desc_preview = if desc.len() > 500 {
-        format!("{}…", desc[..500].trim_end())
-    } else {
-        desc
-    };
-    let tags: Vec<&str> = v["tags"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|t| t.as_str()).take(8).collect())
-        .unwrap_or_default();
-
-    println!("{title}");
-    println!("{channel}  ·  {duration}  ·  {views} views  ·  {likes} likes  ·  {uploaded}");
-    println!("https://youtu.be/{video_id}");
-    if !desc_preview.is_empty() {
-        println!("\n{desc_preview}");
-    }
-    if !tags.is_empty() {
-        println!("\ntags: {}", tags.join(", "));
-    }
-    Ok(())
-}
-
-async fn comments_cmd(
-    target: Option<&str>,
-    device: Option<&str>,
-    limit: usize,
-    timeout: u64,
-) -> Result<()> {
-    let video_id = resolve_video_id(target, device, timeout).await?;
-    let max = (limit * 2).to_string(); // fetch a few extra in case some are empty
-    let extra = [
-        "--write-comments",
-        "--extractor-args",
-        // top-sorted, cap at requested limit
-        &format!("youtube:comment_sort=top;max_comments={max},all,{max}"),
-    ];
-    // yt-dlp puts comments in the info dict when --write-comments is combined with -j
-    let v = yt_dlp_json(&video_id, &extra)?;
-
-    let comments = match v["comments"].as_array() {
-        Some(c) if !c.is_empty() => c,
-        _ => {
-            println!("no comments found");
-            return Ok(());
-        }
-    };
-
-    println!("Top comments for https://youtu.be/{video_id}\n");
-    for c in comments.iter().take(limit) {
-        let author = c["author"].as_str().unwrap_or("unknown");
-        let text = c["text"].as_str().unwrap_or("").trim();
-        let likes = c["like_count"].as_u64().unwrap_or(0);
-        let likes_str = if likes > 0 { format!("  ({likes} likes)") } else { String::new() };
-        println!("@{author}{likes_str}");
-        // Truncate very long comments
-        if text.len() > 300 {
-            println!("{}…\n", text[..300].trim_end());
-        } else {
-            println!("{text}\n");
-        }
-    }
-    Ok(())
-}
-
-fn human_views(n: u64) -> String {
-    if n >= 1_000_000_000 {
-        format!("{:.1}B", n as f64 / 1e9)
-    } else if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1e6)
-    } else if n >= 1_000 {
-        format!("{:.1}K", n as f64 / 1e3)
-    } else {
-        n.to_string()
-    }
-}
-
-fn fmt_duration_secs(secs: u64) -> String {
-    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-    if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m}:{s:02}") }
-}
-
-fn transcript(target: &str, lang: &str) -> Result<()> {
-    let video_id = match parse_target(target)? {
-        Target::Video(id) => id,
-        Target::Playlist(_) => bail!("`transcript` requires a single video, not a playlist"),
-    };
-
-    let url = format!("https://www.youtube.com/watch?v={video_id}");
-    let out_stem = std::env::temp_dir().join(format!("tubecast_sub_{video_id}"));
-    let out_template = out_stem.to_string_lossy().to_string();
-
-    let status = std::process::Command::new("yt-dlp")
-        .args([
-            "--skip-download",
-            "--write-auto-subs",
-            "--sub-lang",
-            lang,
-            "--sub-format",
-            "vtt",
-            "-o",
-            &out_template,
-            &url,
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .context("yt-dlp not found; install with `brew install yt-dlp` or `pip install yt-dlp`")?;
-
-    let vtt_path = format!("{out_template}.{lang}.vtt");
-    if !status.success() {
-        let _ = std::fs::remove_file(&vtt_path);
-        bail!("yt-dlp failed (video may have no captions for lang '{lang}')");
-    }
-    let vtt = std::fs::read_to_string(&vtt_path)
-        .with_context(|| format!("subtitle file not found: {vtt_path}"))?;
-    let _ = std::fs::remove_file(&vtt_path);
-
-    println!("{}", parse_vtt(&vtt));
-    Ok(())
-}
-
-fn parse_vtt(vtt: &str) -> String {
-    let mut cues: Vec<Vec<String>> = Vec::new();
-    let mut current: Vec<String> = Vec::new();
-    let mut in_cue = false;
-
-    for line in vtt.lines() {
-        let line = line.trim();
-        if line.contains("-->") {
-            if !current.is_empty() {
-                cues.push(current.clone());
-                current.clear();
-            }
-            in_cue = true;
-            continue;
-        }
-        if line.is_empty() {
-            in_cue = false;
-            continue;
-        }
-        if line.starts_with("WEBVTT") || line.starts_with("NOTE") || line.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-        if in_cue {
-            let s = strip_vtt_tags(line);
-            if !s.is_empty() {
-                current.push(s);
-            }
-        }
-    }
-    if !current.is_empty() {
-        cues.push(current);
-    }
-
-    // YouTube auto-subs use a rolling window: cue N repeats lines from cue N-1.
-    // Only emit lines that are new relative to the previous cue.
-    let mut out: Vec<String> = Vec::new();
-    let mut prev: Vec<String> = Vec::new();
-    for cue in cues {
-        for line in &cue {
-            if !prev.contains(line) {
-                out.push(line.clone());
-            }
-        }
-        prev = cue;
-    }
-    out.join("\n")
-}
-
-fn strip_vtt_tags(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut in_tag = false;
-    for c in s.chars() {
-        match c {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(c),
-            _ => {}
-        }
-    }
-    out.trim().to_string()
 }
 
 fn slugify(s: &str) -> String {
@@ -1170,89 +621,6 @@ fn fmt_secs(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- strip_vtt_tags ---
-
-    #[test]
-    fn strip_plain_text_unchanged() {
-        assert_eq!(strip_vtt_tags("hello world"), "hello world");
-    }
-
-    #[test]
-    fn strip_c_tags() {
-        assert_eq!(strip_vtt_tags("<c>hello</c>"), "hello");
-    }
-
-    #[test]
-    fn strip_timestamp_tags() {
-        assert_eq!(strip_vtt_tags("<00:00:01.000><c>hello</c>"), "hello");
-    }
-
-    #[test]
-    fn strip_mixed_inline_tags() {
-        assert_eq!(
-            strip_vtt_tags("Hello <00:00:01.920><c> world</c>"),
-            "Hello  world"
-        );
-    }
-
-    #[test]
-    fn strip_trims_whitespace() {
-        assert_eq!(strip_vtt_tags("  <c>text</c>  "), "text");
-    }
-
-    #[test]
-    fn strip_empty_after_tags() {
-        assert_eq!(strip_vtt_tags("<c></c>"), "");
-    }
-
-    // --- parse_vtt ---
-
-    #[test]
-    fn parse_skips_header_and_timestamps() {
-        let vtt = "WEBVTT\nKind: captions\n\n\
-                   00:00:01.000 --> 00:00:03.000\nhello world\n\n";
-        assert_eq!(parse_vtt(vtt), "hello world");
-    }
-
-    #[test]
-    fn parse_strips_inline_tags() {
-        let vtt = "WEBVTT\n\n\
-                   00:00:01.000 --> 00:00:03.000\n<00:00:01.000><c>hello</c>\n\n";
-        assert_eq!(parse_vtt(vtt), "hello");
-    }
-
-    #[test]
-    fn parse_deduplicates_rolling_window() {
-        // YouTube pattern: cue 2 repeats line from cue 1 and adds new line.
-        let vtt = "WEBVTT\n\n\
-                   00:00:01.000 --> 00:00:02.000\nfirst line\n\n\
-                   00:00:02.000 --> 00:00:03.000\nfirst line\nsecond line\n\n\
-                   00:00:03.000 --> 00:00:04.000\nsecond line\nthird line\n\n";
-        assert_eq!(parse_vtt(vtt), "first line\nsecond line\nthird line");
-    }
-
-    #[test]
-    fn parse_skips_note_blocks() {
-        let vtt = "WEBVTT\n\nNOTE\nsome metadata\n\n\
-                   00:00:01.000 --> 00:00:02.000\nhello\n\n";
-        assert_eq!(parse_vtt(vtt), "hello");
-    }
-
-    #[test]
-    fn parse_skips_cue_sequence_numbers() {
-        let vtt = "WEBVTT\n\n\
-                   1\n00:00:01.000 --> 00:00:02.000\nfoo\n\n\
-                   2\n00:00:02.000 --> 00:00:03.000\nfoo\nbar\n\n";
-        assert_eq!(parse_vtt(vtt), "foo\nbar");
-    }
-
-    #[test]
-    fn parse_empty_vtt() {
-        assert_eq!(parse_vtt("WEBVTT\n\n"), "");
-    }
-
-    // --- slugify ---
 
     #[test]
     fn slugify_basic() {
