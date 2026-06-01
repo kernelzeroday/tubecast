@@ -9,14 +9,38 @@ pub struct Device {
     pub name: String,
     pub screen_id: String,
     pub lounge_token: String,
+    /// Base URL of the device's web server (e.g. a Playlet TV at
+    /// http://192.168.1.209:8888), used as a no-key search backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_url: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub default_device: Option<String>,
+    /// Fallback Invidious-style API base used for search when a device has no
+    /// web_url (e.g. https://invidious.example).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_instance: Option<String>,
     #[serde(default)]
     pub devices: Vec<Device>,
+}
+
+impl Device {
+    /// Resolve the Invidious-style search API base for this device, falling
+    /// back to a configured global instance.
+    pub fn search_base(&self, cfg: &Config) -> Option<String> {
+        if let Some(web) = &self.web_url {
+            return Some(format!(
+                "{}/playlet-invidious-backend",
+                web.trim_end_matches('/')
+            ));
+        }
+        cfg.search_instance
+            .as_ref()
+            .map(|s| s.trim_end_matches('/').to_string())
+    }
 }
 
 impl Config {
@@ -33,8 +57,7 @@ impl Config {
         }
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("reading config at {}", path.display()))?;
-        serde_json::from_str(&text)
-            .with_context(|| format!("parsing config at {}", path.display()))
+        serde_json::from_str(&text).with_context(|| format!("parsing config at {}", path.display()))
     }
 
     pub fn save(&self) -> Result<()> {
@@ -80,16 +103,26 @@ impl Config {
         );
     }
 
-    pub fn upsert(&mut self, device: Device) {
+    pub fn upsert(&mut self, mut device: Device) {
         if let Some(existing) = self
             .devices
             .iter_mut()
             .find(|d| d.alias.eq_ignore_ascii_case(&device.alias))
         {
+            // Keep a previously-set web_url unless the new pairing supplies one.
+            if device.web_url.is_none() {
+                device.web_url = existing.web_url.take();
+            }
             *existing = device;
         } else {
             self.devices.push(device);
         }
+    }
+
+    pub fn device_mut(&mut self, alias: &str) -> Option<&mut Device> {
+        self.devices
+            .iter_mut()
+            .find(|d| d.alias.eq_ignore_ascii_case(alias))
     }
 
     /// Persist a refreshed lounge token for the device with this screen id.

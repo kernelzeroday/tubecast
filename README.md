@@ -74,8 +74,10 @@ This puts `tubecast` on your `PATH` (`~/.cargo/bin`). Or just `cargo build
 | `volume <0-100>` | Set volume |
 | `mute` / `unmute` | Toggle audio |
 | `skip-ad` | Skip the current ad |
+| `search <query> [-q] [--first] [--limit N]` | Search YouTube and cast a result |
 | `status [--timeout N]` | Show what's currently playing |
 | `devices` | List paired TVs |
+| `link-web <url>` | Attach a TV's web address for keyless search |
 
 Anything that takes a target accepts a full URL, a `youtu.be` link, a
 `/shorts`, `/embed`, or `/live` URL, a bare 11-character video id, or a playlist
@@ -95,6 +97,49 @@ tubecast play "dQw4w9WgXcQ" --device bedroom
 
 Pass `--default` to `pair` (or pick the only paired device automatically) to set
 which TV commands hit when `--device` is omitted.
+
+### Search
+
+Search and cast without leaving the terminal:
+
+```sh
+tubecast search tool schism
+```
+
+In a terminal this opens a **fuzzy picker** — start typing to filter, arrow
+keys to move, Enter to cast the highlighted result:
+
+```
+? Cast which video? ›
+❯ TOOL - Schism (Official Video)  —  TOOL · 7:27 · 72M views
+  TOOL - Schism (Official Audio)  —  TOOL · 6:46 · 15M views
+  TOOL - Schism (LIVE) 4K  —  FirstRowConcert · 8:23 · 1M views
+```
+
+Flags:
+
+- `-q`, `--queue` — add the choice to the queue instead of playing it now
+- `--first` — skip the picker and cast the top hit (handy in scripts)
+- `-l`, `--limit N` — number of results to show (default 15)
+
+When output isn't a terminal (piped), `search` prints `videoId<TAB>label` lines
+instead of prompting, so you can wire it into other tools:
+
+```sh
+tubecast search lo-fi beats | fzf | cut -f1 | xargs tubecast play
+```
+
+**Search backend.** Results come from an Invidious-style API — no API key. The
+nicest setup is to point a paired TV at its own web server (Playlet exposes an
+Invidious proxy):
+
+```sh
+tubecast link-web http://192.168.1.209:8888
+```
+
+After that, `search` uses that TV's backend automatically. Alternatively, set
+`search_instance` in the config to any public Invidious instance to use as a
+fallback for devices without a linked web address.
 
 ## How it works
 

@@ -8,7 +8,9 @@ pub enum Target {
 }
 
 fn looks_like_video_id(s: &str) -> bool {
-    s.len() == 11 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    s.len() == 11
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 fn looks_like_playlist_id(s: &str) -> bool {
@@ -57,29 +59,27 @@ fn from_url(url: &Url) -> Result<Target> {
                 return Ok(Target::Video((*id).to_string()));
             }
         }
-        "youtube.com" | "m.youtube.com" | "music.youtube.com" => {
-            match segments.first().copied() {
-                Some("watch") => {
-                    if let Some(v) = query("v") {
-                        return Ok(Target::Video(v));
-                    }
-                    if let Some(list) = query("list") {
-                        return Ok(Target::Playlist(list));
-                    }
+        "youtube.com" | "m.youtube.com" | "music.youtube.com" => match segments.first().copied() {
+            Some("watch") => {
+                if let Some(v) = query("v") {
+                    return Ok(Target::Video(v));
                 }
-                Some("playlist") => {
-                    if let Some(list) = query("list") {
-                        return Ok(Target::Playlist(list));
-                    }
+                if let Some(list) = query("list") {
+                    return Ok(Target::Playlist(list));
                 }
-                Some("shorts") | Some("embed") | Some("live") | Some("v") => {
-                    if let Some(id) = segments.get(1) {
-                        return Ok(Target::Video((*id).to_string()));
-                    }
-                }
-                _ => {}
             }
-        }
+            Some("playlist") => {
+                if let Some(list) = query("list") {
+                    return Ok(Target::Playlist(list));
+                }
+            }
+            Some("shorts") | Some("embed") | Some("live") | Some("v") => {
+                if let Some(id) = segments.get(1) {
+                    return Ok(Target::Video((*id).to_string()));
+                }
+            }
+            _ => {}
+        },
         _ => {}
     }
     bail!("unsupported YouTube URL: {url}");

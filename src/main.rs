@@ -1,10 +1,13 @@
 mod config;
 mod parse;
+mod search;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use config::{Config, Device};
+use dialoguer::{theme::ColorfulTheme, FuzzySelect};
 use parse::{parse_target, Target};
+use std::io::IsTerminal;
 use std::time::Duration;
 use tokio::time::{sleep, Instant};
 use youtube_lounge_rs::{LoungeClient, LoungeEvent, PlaybackStatus};
@@ -82,6 +85,23 @@ enum Command {
         #[command(flatten)]
         dev: DeviceArg,
     },
+    /// Search YouTube and cast a result
+    Search {
+        /// Search terms
+        #[arg(required = true, num_args = 1..)]
+        query: Vec<String>,
+        /// Queue the choice instead of playing it now
+        #[arg(short, long)]
+        queue: bool,
+        /// Skip the picker and cast the top result
+        #[arg(long)]
+        first: bool,
+        /// Maximum number of results to show
+        #[arg(short, long, default_value_t = 15)]
+        limit: usize,
+        #[command(flatten)]
+        dev: DeviceArg,
+    },
     /// Show what is currently playing
     Status {
         #[command(flatten)]
@@ -92,6 +112,13 @@ enum Command {
     },
     /// List paired devices
     Devices,
+    /// Associate a device's web address (e.g. a Playlet TV) for keyless search
+    LinkWeb {
+        /// Base URL, e.g. http://192.168.1.209:8888
+        url: String,
+        #[command(flatten)]
+        dev: DeviceArg,
+    },
 }
 
 #[tokio::main]
@@ -119,10 +146,22 @@ async fn run() -> Result<()> {
         Command::SkipAd(d) => simple(d.device.as_deref(), Action::SkipAd).await,
         Command::Mute(d) => simple(d.device.as_deref(), Action::Mute).await,
         Command::Unmute(d) => simple(d.device.as_deref(), Action::Unmute).await,
-        Command::Seek { seconds, dev } => simple(dev.device.as_deref(), Action::Seek(seconds)).await,
-        Command::Volume { level, dev } => simple(dev.device.as_deref(), Action::Volume(level)).await,
+        Command::Seek { seconds, dev } => {
+            simple(dev.device.as_deref(), Action::Seek(seconds)).await
+        }
+        Command::Volume { level, dev } => {
+            simple(dev.device.as_deref(), Action::Volume(level)).await
+        }
+        Command::Search {
+            query,
+            queue,
+            first,
+            limit,
+            dev,
+        } => run_search(&query.join(" "), dev.device.as_deref(), queue, first, limit).await,
         Command::Status { dev, timeout } => status(dev.device.as_deref(), timeout).await,
         Command::Devices => devices(),
+        Command::LinkWeb { url, dev } => link_web(&url, dev.device.as_deref()),
     }
 }
 
@@ -142,6 +181,7 @@ async fn pair(code: &str, alias: Option<String>, default: bool) -> Result<()> {
         name: name.clone(),
         screen_id: screen.screen_id,
         lounge_token: screen.lounge_token,
+        web_url: None,
     });
     if make_default {
         cfg.default_device = Some(alias.clone());
@@ -374,6 +414,100 @@ fn devices() -> Result<()> {
     Ok(())
 }
 
+async fn run_search(
+    query: &str,
+    device: Option<&str>,
+    queue: bool,
+    first: bool,
+    limit: usize,
+) -> Result<()> {
+    let cfg = Config::load()?;
+    let base = {
+        let dev = cfg.resolve(device)?;
+        dev.search_base(&cfg).with_context(|| {
+            format!(
+                "no search backend for '{}'. Link a Playlet TV with \
+                 `tubecast link-web http://<tv-ip>:8888`, or set search_instance \
+                 in the config to an Invidious instance.",
+                dev.alias
+            )
+        })?
+    };
+
+    let results = search::search(&base, query, limit).await?;
+    if results.is_empty() {
+        println!("no results for \"{query}\"");
+        return Ok(());
+    }
+
+    let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    let idx = if first {
+        0
+    } else if !interactive {
+        // Scriptable: emit "<videoId>\t<label>" and let the caller choose.
+        for r in &results {
+            println!("{}\t{}", r.video_id, r.label());
+        }
+        return Ok(());
+    } else {
+        let labels: Vec<String> = results.iter().map(search::SearchResult::label).collect();
+        let prompt = if queue {
+            "Queue which video?"
+        } else {
+            "Cast which video?"
+        };
+        match FuzzySelect::with_theme(&ColorfulTheme::default())
+            .with_prompt(prompt)
+            .items(&labels)
+            .default(0)
+            .interact_opt()?
+        {
+            Some(i) => i,
+            None => {
+                println!("cancelled");
+                return Ok(());
+            }
+        }
+    };
+
+    let chosen = &results[idx];
+    cast_video(&cfg, device, &chosen.video_id, queue).await?;
+    println!(
+        "{} https://youtu.be/{}  ({})",
+        if queue { "queued" } else { "playing" },
+        chosen.video_id,
+        chosen.title
+    );
+    Ok(())
+}
+
+async fn cast_video(cfg: &Config, device: Option<&str>, video_id: &str, queue: bool) -> Result<()> {
+    let client = build_client(cfg, device)?;
+    connect_ready(&client).await?;
+    if queue {
+        client.add_video_to_queue(video_id.to_string()).await?;
+    } else {
+        client.play_video(video_id.to_string()).await?;
+    }
+    finish(&client).await;
+    Ok(())
+}
+
+fn link_web(url: &str, device: Option<&str>) -> Result<()> {
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        bail!("url must start with http:// or https://");
+    }
+    let mut cfg = Config::load()?;
+    let alias = cfg.resolve(device)?.alias.clone();
+    let trimmed = url.trim_end_matches('/').to_string();
+    if let Some(d) = cfg.device_mut(&alias) {
+        d.web_url = Some(trimmed.clone());
+    }
+    cfg.save()?;
+    println!("linked '{alias}' -> {trimmed} (search enabled)");
+    Ok(())
+}
+
 fn build_client(cfg: &Config, device: Option<&str>) -> Result<LoungeClient> {
     let dev = cfg.resolve(device)?;
     let client = LoungeClient::new(&dev.screen_id, &dev.lounge_token, DEVICE_NAME, None, None);
@@ -384,7 +518,7 @@ fn build_client(cfg: &Config, device: Option<&str>) -> Result<LoungeClient> {
 /// to Connected; send_command errors until then, so wait for readiness.
 async fn connect_ready(client: &LoungeClient) -> Result<()> {
     client
-        .set_token_refresh_callback(|screen_id, token| Config::update_token(screen_id, token))
+        .set_token_refresh_callback(Config::update_token)
         .await;
     client
         .connect_with_refresh()
