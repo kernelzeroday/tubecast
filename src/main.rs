@@ -119,6 +119,14 @@ enum Command {
         #[command(flatten)]
         dev: DeviceArg,
     },
+    /// Fetch and print the transcript for a video (requires yt-dlp)
+    Transcript {
+        /// YouTube URL or video id
+        target: String,
+        /// Subtitle language code
+        #[arg(short, long, default_value = "en")]
+        lang: String,
+    },
 }
 
 #[tokio::main]
@@ -162,6 +170,7 @@ async fn run() -> Result<()> {
         Command::Status { dev, timeout } => status(dev.device.as_deref(), timeout).await,
         Command::Devices => devices(),
         Command::LinkWeb { url, dev } => link_web(&url, dev.device.as_deref()),
+        Command::Transcript { target, lang } => transcript(&target, &lang),
     }
 }
 
@@ -309,6 +318,10 @@ async fn simple(device: Option<&str>, action: Action) -> Result<()> {
     let mut rx = client.event_receiver();
     connect_ready(&client).await?;
 
+    // Discard events buffered during connection so stale NowPlaying/StateChange
+    // events don't falsely confirm the action before the TV sees it.
+    drain_events(&mut rx);
+
     // The bind channel can drop a freshly-sent control command before the
     // screen acts on it, so send, wait for the screen to confirm the new
     // state, and resend once if the first attempt goes unacknowledged.
@@ -326,6 +339,15 @@ async fn simple(device: Option<&str>, action: Action) -> Result<()> {
     );
     finish(&client).await;
     Ok(())
+}
+
+fn drain_events(rx: &mut tokio::sync::broadcast::Receiver<LoungeEvent>) {
+    loop {
+        match rx.try_recv() {
+            Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(_) => break,
+        }
+    }
 }
 
 async fn wait_confirm(
@@ -547,6 +569,108 @@ async fn finish(client: &LoungeClient) {
     let _ = client.disconnect().await;
 }
 
+fn transcript(target: &str, lang: &str) -> Result<()> {
+    let video_id = match parse_target(target)? {
+        Target::Video(id) => id,
+        Target::Playlist(_) => bail!("`transcript` requires a single video, not a playlist"),
+    };
+
+    let url = format!("https://www.youtube.com/watch?v={video_id}");
+    let out_stem = std::env::temp_dir().join(format!("tubecast_sub_{video_id}"));
+    let out_template = out_stem.to_string_lossy().to_string();
+
+    let status = std::process::Command::new("yt-dlp")
+        .args([
+            "--skip-download",
+            "--write-auto-subs",
+            "--sub-lang",
+            lang,
+            "--sub-format",
+            "vtt",
+            "-o",
+            &out_template,
+            &url,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .context("yt-dlp not found; install with `brew install yt-dlp` or `pip install yt-dlp`")?;
+
+    if !status.success() {
+        bail!("yt-dlp failed (video may have no captions for lang '{lang}')");
+    }
+
+    let vtt_path = format!("{out_template}.{lang}.vtt");
+    let vtt = std::fs::read_to_string(&vtt_path)
+        .with_context(|| format!("subtitle file not found: {vtt_path}"))?;
+    let _ = std::fs::remove_file(&vtt_path);
+
+    println!("{}", parse_vtt(&vtt));
+    Ok(())
+}
+
+fn parse_vtt(vtt: &str) -> String {
+    let mut cues: Vec<Vec<String>> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut in_cue = false;
+
+    for line in vtt.lines() {
+        let line = line.trim();
+        if line.contains("-->") {
+            if !current.is_empty() {
+                cues.push(current.clone());
+                current.clear();
+            }
+            in_cue = true;
+            continue;
+        }
+        if line.is_empty() {
+            in_cue = false;
+            continue;
+        }
+        if line.starts_with("WEBVTT") || line.starts_with("NOTE") || line.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        if in_cue {
+            let s = strip_vtt_tags(line);
+            if !s.is_empty() {
+                current.push(s);
+            }
+        }
+    }
+    if !current.is_empty() {
+        cues.push(current);
+    }
+
+    // YouTube auto-subs use a rolling window: cue N repeats lines from cue N-1.
+    // Only emit lines that are new relative to the previous cue.
+    let mut out: Vec<String> = Vec::new();
+    let mut prev: Vec<String> = Vec::new();
+    for cue in cues {
+        for line in &cue {
+            if !prev.contains(line) {
+                out.push(line.clone());
+            }
+        }
+        prev = cue;
+    }
+    out.join("\n")
+}
+
+fn strip_vtt_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.trim().to_string()
+}
+
 fn slugify(s: &str) -> String {
     let lowered: String = s
         .chars()
@@ -583,4 +707,108 @@ fn fmt_secs(s: &str) -> String {
     s.parse::<f64>()
         .map(|v| format!("{v:.0}"))
         .unwrap_or_else(|_| s.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- strip_vtt_tags ---
+
+    #[test]
+    fn strip_plain_text_unchanged() {
+        assert_eq!(strip_vtt_tags("hello world"), "hello world");
+    }
+
+    #[test]
+    fn strip_c_tags() {
+        assert_eq!(strip_vtt_tags("<c>hello</c>"), "hello");
+    }
+
+    #[test]
+    fn strip_timestamp_tags() {
+        assert_eq!(strip_vtt_tags("<00:00:01.000><c>hello</c>"), "hello");
+    }
+
+    #[test]
+    fn strip_mixed_inline_tags() {
+        assert_eq!(
+            strip_vtt_tags("Hello <00:00:01.920><c> world</c>"),
+            "Hello  world"
+        );
+    }
+
+    #[test]
+    fn strip_trims_whitespace() {
+        assert_eq!(strip_vtt_tags("  <c>text</c>  "), "text");
+    }
+
+    #[test]
+    fn strip_empty_after_tags() {
+        assert_eq!(strip_vtt_tags("<c></c>"), "");
+    }
+
+    // --- parse_vtt ---
+
+    #[test]
+    fn parse_skips_header_and_timestamps() {
+        let vtt = "WEBVTT\nKind: captions\n\n\
+                   00:00:01.000 --> 00:00:03.000\nhello world\n\n";
+        assert_eq!(parse_vtt(vtt), "hello world");
+    }
+
+    #[test]
+    fn parse_strips_inline_tags() {
+        let vtt = "WEBVTT\n\n\
+                   00:00:01.000 --> 00:00:03.000\n<00:00:01.000><c>hello</c>\n\n";
+        assert_eq!(parse_vtt(vtt), "hello");
+    }
+
+    #[test]
+    fn parse_deduplicates_rolling_window() {
+        // YouTube pattern: cue 2 repeats line from cue 1 and adds new line.
+        let vtt = "WEBVTT\n\n\
+                   00:00:01.000 --> 00:00:02.000\nfirst line\n\n\
+                   00:00:02.000 --> 00:00:03.000\nfirst line\nsecond line\n\n\
+                   00:00:03.000 --> 00:00:04.000\nsecond line\nthird line\n\n";
+        assert_eq!(parse_vtt(vtt), "first line\nsecond line\nthird line");
+    }
+
+    #[test]
+    fn parse_skips_note_blocks() {
+        let vtt = "WEBVTT\n\nNOTE\nsome metadata\n\n\
+                   00:00:01.000 --> 00:00:02.000\nhello\n\n";
+        assert_eq!(parse_vtt(vtt), "hello");
+    }
+
+    #[test]
+    fn parse_skips_cue_sequence_numbers() {
+        let vtt = "WEBVTT\n\n\
+                   1\n00:00:01.000 --> 00:00:02.000\nfoo\n\n\
+                   2\n00:00:02.000 --> 00:00:03.000\nfoo\nbar\n\n";
+        assert_eq!(parse_vtt(vtt), "foo\nbar");
+    }
+
+    #[test]
+    fn parse_empty_vtt() {
+        assert_eq!(parse_vtt("WEBVTT\n\n"), "");
+    }
+
+    // --- slugify ---
+
+    #[test]
+    fn slugify_basic() {
+        assert_eq!(slugify("My TV"), "my-tv");
+    }
+
+    #[test]
+    fn slugify_collapses_dashes() {
+        assert_eq!(slugify("Living Room TV!"), "living-room-tv");
+        assert_eq!(slugify("foo!!bar"), "foo-bar");
+    }
+
+    #[test]
+    fn slugify_empty_falls_back() {
+        assert_eq!(slugify("!!!"), "tv");
+    }
 }
