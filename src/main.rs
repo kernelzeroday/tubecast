@@ -4,7 +4,7 @@ mod search;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use config::{Config, Device};
+use config::{Config, Device, LocalQueue};
 use dialoguer::{theme::ColorfulTheme, FuzzySelect};
 use parse::{parse_target, Target};
 use std::io::IsTerminal;
@@ -119,6 +119,11 @@ enum Command {
         #[command(flatten)]
         dev: DeviceArg,
     },
+    /// Shuffle the upcoming queue (reorders locally-tracked videos)
+    Shuffle {
+        #[command(flatten)]
+        dev: DeviceArg,
+    },
     /// Fetch and print the transcript for a video (requires yt-dlp)
     Transcript {
         /// YouTube URL or video id
@@ -170,6 +175,7 @@ async fn run() -> Result<()> {
         Command::Status { dev, timeout } => status(dev.device.as_deref(), timeout).await,
         Command::Devices => devices(),
         Command::LinkWeb { url, dev } => link_web(&url, dev.device.as_deref()),
+        Command::Shuffle { dev } => shuffle(dev.device.as_deref()).await,
         Command::Transcript { target, lang } => transcript(&target, &lang),
     }
 }
@@ -211,6 +217,7 @@ async fn play(target: &str, device: Option<&str>) -> Result<()> {
     match parse_target(target)? {
         Target::Video(id) => {
             client.play_video(id.clone()).await.context("send play")?;
+            let _ = LocalQueue::reset(&id);
             println!("playing https://youtu.be/{id}");
         }
         Target::Playlist(list) => {
@@ -235,6 +242,7 @@ async fn add(target: &str, device: Option<&str>) -> Result<()> {
                 .add_video_to_queue(id.clone())
                 .await
                 .context("send add")?;
+            let _ = LocalQueue::push(&id);
             println!("queued https://youtu.be/{id}");
         }
         Target::Playlist(_) => bail!("`add` takes a single video; use `play` for a playlist"),
@@ -508,8 +516,10 @@ async fn cast_video(cfg: &Config, device: Option<&str>, video_id: &str, queue: b
     connect_ready(&client).await?;
     if queue {
         client.add_video_to_queue(video_id.to_string()).await?;
+        let _ = LocalQueue::push(video_id);
     } else {
         client.play_video(video_id.to_string()).await?;
+        let _ = LocalQueue::reset(video_id);
     }
     finish(&client).await;
     Ok(())
@@ -567,6 +577,70 @@ async fn connect_ready(client: &LoungeClient) -> Result<()> {
 async fn finish(client: &LoungeClient) {
     sleep(Duration::from_millis(300)).await;
     let _ = client.disconnect().await;
+}
+
+async fn shuffle(device: Option<&str>) -> Result<()> {
+    let mut q = LocalQueue::load()?;
+    if q.video_ids.len() < 2 {
+        bail!("nothing in the queue to shuffle");
+    }
+
+    // Fisher-Yates on the tail (keep the currently-playing video at index 0)
+    let mut rng = Rng::new();
+    let tail = &mut q.video_ids[1..];
+    for i in (1..tail.len()).rev() {
+        let j = rng.next() % (i + 1);
+        tail.swap(i, j);
+    }
+
+    let cfg = Config::load()?;
+    let client = build_client(&cfg, device)?;
+    connect_ready(&client).await?;
+
+    // Re-issue play for index 1 (first upcoming), then add the rest.
+    // Index 0 is already playing so we leave it alone.
+    let upcoming = q.video_ids[1..].to_vec();
+    client
+        .play_video(upcoming[0].clone())
+        .await
+        .context("send play for shuffled head")?;
+    finish(&client).await;
+
+    // Re-connect for the queue additions
+    let client = build_client(&cfg, device)?;
+    connect_ready(&client).await?;
+    for id in &upcoming[1..] {
+        client
+            .add_video_to_queue(id.clone())
+            .await
+            .context("send add for shuffled video")?;
+    }
+    finish(&client).await;
+
+    q.save()?;
+    println!("shuffled {} upcoming videos", upcoming.len());
+    Ok(())
+}
+
+struct Rng(u64);
+
+impl Rng {
+    fn new() -> Self {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        std::time::SystemTime::now().hash(&mut h);
+        std::thread::current().id().hash(&mut h);
+        Self(h.finish())
+    }
+
+    fn next(&mut self) -> usize {
+        // xorshift64
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0 as usize
+    }
 }
 
 fn transcript(target: &str, lang: &str) -> Result<()> {
