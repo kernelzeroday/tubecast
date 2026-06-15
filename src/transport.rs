@@ -201,22 +201,33 @@ pub enum CastResult {
 /// Send `play_video` and wait for the screen to confirm, resending once if the
 /// first command goes unacknowledged (the bind channel can drop a command sent
 /// immediately after connecting — the same issue handled in `wait_confirm`).
+///
+/// When the TV reports a *different* video (stale NowPlaying from the previous
+/// track), we keep waiting rather than bailing — the TV often emits the old
+/// video's state before switching to the new one.
 pub async fn play_video_confirmed(
     client: &LoungeClient,
     rx: &mut tokio::sync::broadcast::Receiver<LoungeEvent>,
     video_id: &str,
 ) -> Result<CastResult> {
     let mut other: Option<String> = None;
-    for (attempt, wait_ms) in [(0u8, 2500u64), (1, 5000)] {
+    for (attempt, wait_ms) in [(0u8, 3000u64), (1, 6000)] {
         let what = if attempt == 0 { "send play" } else { "resend play" };
         client
             .play_video(video_id.to_string())
             .await
             .context(what)?;
-        match wait_playing(rx, Duration::from_millis(wait_ms)).await {
-            Some(pb) if pb.video_id == video_id => return Ok(CastResult::Confirmed(pb.status)),
-            Some(pb) => other = Some(pb.video_id),
-            None => {}
+        let deadline = Instant::now() + Duration::from_millis(wait_ms);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match wait_playing(rx, remaining).await {
+                Some(pb) if pb.video_id == video_id => return Ok(CastResult::Confirmed(pb.status)),
+                Some(pb) => other = Some(pb.video_id),
+                None => break,
+            }
         }
     }
     Ok(other.map_or(CastResult::Unconfirmed, CastResult::OtherPlaying))
@@ -296,30 +307,3 @@ pub async fn get_now_playing(cfg: &Config, device: Option<&str>, timeout: u64) -
     found
 }
 
-pub async fn replay_queue(
-    cfg: &Config,
-    device: Option<&str>,
-    current: &str,
-    tail: &[String],
-) -> Result<()> {
-    let client = build_client(cfg, device)?;
-    connect_ready(&client).await?;
-    client
-        .play_video(current.to_string())
-        .await
-        .context("send play")?;
-    finish(&client).await;
-
-    if !tail.is_empty() {
-        let client = build_client(cfg, device)?;
-        connect_ready(&client).await?;
-        for id in tail {
-            client
-                .add_video_to_queue(id.clone())
-                .await
-                .context("send add")?;
-        }
-        finish(&client).await;
-    }
-    Ok(())
-}

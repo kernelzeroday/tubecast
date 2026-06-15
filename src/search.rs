@@ -10,6 +10,7 @@ pub struct SearchResult {
     pub length: String,
     pub views: String,
     pub published: String,
+    pub is_live: bool,
 }
 
 impl SearchResult {
@@ -19,7 +20,9 @@ impl SearchResult {
         if !self.author.is_empty() {
             meta.push(self.author.clone());
         }
-        if !self.length.is_empty() {
+        if self.is_live {
+            meta.push("LIVE".to_string());
+        } else if !self.length.is_empty() {
             meta.push(self.length.clone());
         }
         if !self.views.is_empty() {
@@ -36,17 +39,32 @@ impl SearchResult {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct SearchFilter {
+    pub live: bool,
+    pub sort_by: Option<String>,
+}
+
 /// Query an Invidious-style search API. Tolerates both the vanilla Invidious
 /// shape (top-level array) and Playlet's invidious-companion shape
 /// (`{ "items": [...] }`), and the differing field names between them.
-pub async fn search(base: &str, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+pub async fn search(base: &str, query: &str, limit: usize, page: usize, filter: &SearchFilter) -> Result<Vec<SearchResult>> {
     let url = format!("{}/api/v1/search", base.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()?;
+    let sort_param = filter.sort_by.as_deref().unwrap_or("");
+    let page_str = page.to_string();
+    let mut params: Vec<(&str, &str)> = vec![("q", query), ("type", "video"), ("page", &page_str)];
+    if filter.live {
+        params.push(("features", "live"));
+    }
+    if !sort_param.is_empty() {
+        params.push(("sort_by", sort_param));
+    }
     let resp = client
         .get(&url)
-        .query(&[("q", query), ("type", "video")])
+        .query(&params)
         .send()
         .await
         .with_context(|| format!("requesting {url}"))?;
@@ -80,6 +98,47 @@ pub async fn search(base: &str, query: &str, limit: usize) -> Result<Vec<SearchR
     Ok(out)
 }
 
+/// Fetch the device's on-device search history. Playlet exposes this at
+/// `/api/search-history` (on the web root, not the invidious backend) as a
+/// JSON array of query strings, most-recent first.
+pub async fn search_history(web_base: &str) -> Result<Vec<String>> {
+    let url = format!("{}/api/search-history", web_base.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("requesting {url}"))?;
+    if !resp.status().is_success() {
+        bail!("device returned HTTP {} for search history", resp.status());
+    }
+    resp.json().await.context("parsing search history")
+}
+
+/// Fetch a single video's title from an Invidious-style backend. Best-effort:
+/// returns None on any network or parse failure, so callers can degrade
+/// gracefully when no metadata backend is reachable.
+pub async fn video_title(base: &str, video_id: &str) -> Option<String> {
+    let url = format!("{}/api/v1/videos/{}", base.trim_end_matches('/'), video_id);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .ok()?;
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: Value = resp.json().await.ok()?;
+    let title = body.get("title").and_then(Value::as_str)?.trim().to_string();
+    if title.is_empty() {
+        None
+    } else {
+        Some(title)
+    }
+}
+
 fn parse_item(item: &Value) -> Option<SearchResult> {
     // Only videos: must have a videoId and not be a channel/playlist entry.
     let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
@@ -90,6 +149,7 @@ fn parse_item(item: &Value) -> Option<SearchResult> {
     if video_id.is_empty() {
         return None;
     }
+    let is_live = item.get("liveNow").and_then(Value::as_bool).unwrap_or(false);
     let title = str_field(item, "title");
     let author = str_field(item, "author");
     let length = length_field(item);
@@ -102,6 +162,7 @@ fn parse_item(item: &Value) -> Option<SearchResult> {
         length,
         views,
         published,
+        is_live,
     })
 }
 
@@ -196,8 +257,8 @@ fn human_count(n: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
-    // Playlet's invidious-companion shape: { items: [...] } with text fields.
     #[test]
     fn parses_companion_shape() {
         let item = serde_json::json!({
@@ -214,11 +275,11 @@ mod tests {
         assert_eq!(r.length, "7:27");
         assert_eq!(r.views, "72M views");
         assert_eq!(r.published, "7 years ago");
+        assert!(!r.is_live);
         assert!(r.label().contains("TOOL"));
         assert!(r.label().contains("7 years ago"));
     }
 
-    // Vanilla Invidious shape: numeric lengthSeconds / viewCount.
     #[test]
     fn parses_vanilla_shape() {
         let item = serde_json::json!({
@@ -234,11 +295,141 @@ mod tests {
         assert_eq!(r.length, "3:33");
         assert_eq!(r.views, "1.6B views");
         assert!(r.published.contains("years ago"));
+        assert!(!r.is_live);
     }
 
     #[test]
-    fn skips_non_videos() {
-        let channel = serde_json::json!({ "type": "channel", "author": "TOOL" });
-        assert!(parse_item(&channel).is_none());
+    fn detects_live_video() {
+        let item = serde_json::json!({
+            "type": "video",
+            "videoId": "livetest12x",
+            "title": "Live Stream",
+            "author": "Streamer",
+            "liveNow": true,
+            "viewCountText": "1.2K watching"
+        });
+        let r = parse_item(&item).unwrap();
+        assert!(r.is_live);
+        assert!(r.label().contains("LIVE"));
+        assert!(!r.label().contains("· ·"));
+    }
+
+    #[test]
+    fn live_label_replaces_length() {
+        let r = SearchResult {
+            video_id: "x".into(),
+            title: "Stream".into(),
+            author: "A".into(),
+            length: "0:00".into(),
+            views: "1K".into(),
+            published: "".into(),
+            is_live: true,
+        };
+        let l = r.label();
+        assert!(l.contains("LIVE"));
+        assert!(!l.contains("0:00"));
+    }
+
+    #[test]
+    fn label_title_only_when_no_meta() {
+        let r = SearchResult {
+            video_id: "x".into(),
+            title: "Title".into(),
+            author: "".into(),
+            length: "".into(),
+            views: "".into(),
+            published: "".into(),
+            is_live: false,
+        };
+        assert_eq!(r.label(), "Title");
+    }
+
+    #[test]
+    fn parse_item_missing_optional_fields() {
+        let item = serde_json::json!({ "videoId": "abcdefghijk" });
+        let r = parse_item(&item).unwrap();
+        assert_eq!(r.video_id, "abcdefghijk");
+        assert_eq!(r.title, "");
+        assert_eq!(r.author, "");
+        assert_eq!(r.length, "");
+        assert_eq!(r.views, "");
+        assert!(!r.is_live);
+    }
+
+    #[test]
+    fn parse_item_empty_video_id() {
+        let item = serde_json::json!({ "type": "video", "videoId": "" });
+        assert!(parse_item(&item).is_none());
+    }
+
+    #[test]
+    fn parse_item_no_video_id() {
+        let item = serde_json::json!({ "type": "video", "title": "No ID" });
+        assert!(parse_item(&item).is_none());
+    }
+
+    #[test]
+    fn skips_all_non_video_types() {
+        for kind in &["channel", "playlist", "shelf"] {
+            let item = serde_json::json!({ "type": kind, "videoId": "abcdefghijk" });
+            assert!(parse_item(&item).is_none(), "should skip type={kind}");
+        }
+    }
+
+    #[test]
+    fn fmt_duration_edge_cases() {
+        assert_eq!(fmt_duration(0), "0:00");
+        assert_eq!(fmt_duration(1), "0:01");
+        assert_eq!(fmt_duration(59), "0:59");
+        assert_eq!(fmt_duration(60), "1:00");
+        assert_eq!(fmt_duration(3599), "59:59");
+        assert_eq!(fmt_duration(3600), "1:00:00");
+        assert_eq!(fmt_duration(3661), "1:01:01");
+    }
+
+    #[test]
+    fn human_count_boundaries() {
+        assert_eq!(human_count(0), "0");
+        assert_eq!(human_count(999), "999");
+        assert_eq!(human_count(1_000), "1.0K");
+        assert_eq!(human_count(1_500), "1.5K");
+        assert_eq!(human_count(1_000_000), "1.0M");
+        assert_eq!(human_count(1_000_000_000), "1.0B");
+    }
+
+    proptest! {
+        #[test]
+        fn fmt_duration_never_empty(secs in 0i64..1_000_000) {
+            prop_assert!(!fmt_duration(secs).is_empty());
+            let s = fmt_duration(secs);
+            prop_assert!(s.contains(':'), "expected colon in '{s}'");
+        }
+
+        #[test]
+        fn human_count_never_empty(n in 0i64..i64::MAX) {
+            prop_assert!(!human_count(n).is_empty());
+        }
+
+        #[test]
+        fn parse_item_never_panics(
+            vid in "[a-zA-Z0-9_-]{0,15}",
+            title in "[a-zA-Z0-9 ]{0,30}",
+            live in proptest::bool::ANY,
+            secs in 0i64..100_000,
+            kind in prop::sample::select(vec!["video", "channel", "playlist", "shelf", ""]),
+        ) {
+            let mut obj = serde_json::json!({
+                "title": title,
+                "lengthSeconds": secs,
+                "liveNow": live,
+            });
+            if !vid.is_empty() {
+                obj["videoId"] = serde_json::json!(vid);
+            }
+            if !kind.is_empty() {
+                obj["type"] = serde_json::json!(kind);
+            }
+            let _ = parse_item(&obj);
+        }
     }
 }

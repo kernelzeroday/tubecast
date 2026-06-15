@@ -43,61 +43,6 @@ impl Device {
     }
 }
 
-/// Tracks the locally-known queue so `shuffle` can reorder it without
-/// being able to read it back from the TV.
-#[derive(Debug, Default, Serialize, Deserialize)]
-pub struct LocalQueue {
-    pub video_ids: Vec<String>,
-}
-
-impl LocalQueue {
-    fn path() -> Result<PathBuf> {
-        let dirs = ProjectDirs::from("", "", "tubecast")
-            .context("could not determine a config directory for this platform")?;
-        Ok(dirs.config_dir().join("queue.json"))
-    }
-
-    pub fn load() -> Result<Self> {
-        let path = Self::path()?;
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading queue at {}", path.display()))?;
-        serde_json::from_str(&text)
-            .with_context(|| format!("parsing queue at {}", path.display()))
-    }
-
-    pub fn save(&self) -> Result<()> {
-        let path = Self::path()?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let text = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, text)
-            .with_context(|| format!("writing queue at {}", path.display()))?;
-        Ok(())
-    }
-
-    /// Replace the queue with a single video (called on `play`).
-    pub fn reset(video_id: &str) -> Result<()> {
-        Self { video_ids: vec![video_id.to_string()] }.save()
-    }
-
-    /// Append a video to the queue (called on `add`).
-    pub fn push(video_id: &str) -> Result<()> {
-        let mut q = Self::load()?;
-        q.video_ids.push(video_id.to_string());
-        q.save()
-    }
-
-    /// Wipe the local queue (called when playing a playlist, since we can't
-    /// track playlist contents).
-    pub fn clear() -> Result<()> {
-        Self::default().save()
-    }
-}
-
 impl Config {
     pub fn path() -> Result<PathBuf> {
         let dirs = ProjectDirs::from("", "", "tubecast")
